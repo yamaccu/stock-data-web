@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import re
+import zipfile
+from io import BytesIO
+
 import pandas as pd
 import streamlit as st
 import yfinance as yf
@@ -84,11 +87,34 @@ def fetch_stock_data(code: str):
 
     daily = prepare_ohlcv(daily_raw, "1d")
     hourly = prepare_ohlcv(hourly_raw, "1h")
+
     return daily, hourly, file_code, ticker_symbol
 
 
 def dataframe_to_csv_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8-sig")
+
+
+def create_zip_bytes(
+    daily: pd.DataFrame,
+    hourly: pd.DataFrame,
+    file_code: str,
+) -> bytes:
+    """日足CSVと1時間足CSVを1つのZIPにまとめる。"""
+    buffer = BytesIO()
+
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(
+            f"{file_code}_daily.csv",
+            dataframe_to_csv_bytes(daily),
+        )
+        zf.writestr(
+            f"{file_code}_1h.csv",
+            dataframe_to_csv_bytes(hourly),
+        )
+
+    buffer.seek(0)
+    return buffer.getvalue()
 
 
 st.title("📈 株価データ取得")
@@ -117,25 +143,16 @@ if submitted:
             f" 日足 {len(daily):,}行 / 1時間足 {len(hourly):,}行"
         )
 
-        col1, col2 = st.columns(2)
+        zip_data = create_zip_bytes(daily, hourly, file_code)
 
-        with col1:
-            st.download_button(
-                "日足CSVをダウンロード",
-                data=dataframe_to_csv_bytes(daily),
-                file_name=f"{file_code}_daily.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
-
-        with col2:
-            st.download_button(
-                "1時間足CSVをダウンロード",
-                data=dataframe_to_csv_bytes(hourly),
-                file_name=f"{file_code}_1h.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
+        st.download_button(
+            "日足・1時間足CSVをまとめてダウンロード",
+            data=zip_data,
+            file_name=f"{file_code}_stock_data.zip",
+            mime="application/zip",
+            use_container_width=True,
+            type="primary",
+        )
 
         with st.expander("取得データを確認"):
             st.markdown("**日足（末尾10行）**")
