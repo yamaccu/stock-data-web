@@ -11,6 +11,8 @@ import yfinance as yf
 APP_TITLE = "株価データ取得"
 DAILY_PERIOD = "1y"
 HOURLY_PERIOD = "60d"
+RSI_PERIOD = 14
+MA_PERIODS = (5, 25, 75)
 
 st.set_page_config(page_title=APP_TITLE, page_icon="📈", layout="centered")
 
@@ -24,6 +26,34 @@ def normalize_ticker(code: str) -> tuple[str, str]:
         return raw, f"{raw}.T"
 
     return raw, raw
+
+
+def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """終値からRSI(14)と単純移動平均(5/25/75)を計算して追加する。"""
+    out = df.copy()
+    close = out["Close"]
+
+    # Wilder方式のRSI（14期間）
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.ewm(alpha=1 / RSI_PERIOD, adjust=False, min_periods=RSI_PERIOD).mean()
+    avg_loss = loss.ewm(alpha=1 / RSI_PERIOD, adjust=False, min_periods=RSI_PERIOD).mean()
+
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+
+    # 値動きがない場合などのゼロ除算を明示的に処理
+    rsi = rsi.mask((avg_gain == 0) & (avg_loss == 0), 50.0)
+    rsi = rsi.mask((avg_gain > 0) & (avg_loss == 0), 100.0)
+    rsi = rsi.mask((avg_gain == 0) & (avg_loss > 0), 0.0)
+    out[f"RSI{RSI_PERIOD}"] = rsi
+
+    for period in MA_PERIODS:
+        out[f"MA{period}"] = close.rolling(window=period, min_periods=period).mean()
+
+    return out
 
 
 def prepare_ohlcv(df: pd.DataFrame, interval: str) -> pd.DataFrame:
@@ -40,6 +70,7 @@ def prepare_ohlcv(df: pd.DataFrame, interval: str) -> pd.DataFrame:
 
     out = df[required].copy()
     out = out.dropna(subset=["Open", "High", "Low", "Close"], how="all")
+    out = add_technical_indicators(out)
 
     idx = pd.DatetimeIndex(out.index)
 
@@ -167,5 +198,5 @@ if submitted:
 st.divider()
 st.caption(
     "日足: 直近1年 / 1時間足: 直近60日 / "
-    "CSV列: Date(Datetime), Open, High, Low, Close, Volume"
+    "CSV列: Date(Datetime), Open, High, Low, Close, Volume, RSI14, MA5, MA25, MA75"
 )
