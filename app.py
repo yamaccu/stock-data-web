@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import zipfile
+from decimal import Decimal, ROUND_HALF_UP
 from io import BytesIO
 
 import pandas as pd
@@ -28,6 +29,13 @@ def normalize_ticker(code: str) -> tuple[str, str]:
     return raw, raw
 
 
+def round_half_up_1(value: float) -> float:
+    """小数点第2位以下を四捨五入し、小数点第1位までのfloatにする。"""
+    if pd.isna(value):
+        return value
+    return float(Decimal(str(value)).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP))
+
+
 def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """終値からRSI(14)と単純移動平均(5/25/75)を計算して追加する。"""
     out = df.copy()
@@ -48,10 +56,11 @@ def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
     rsi = rsi.mask((avg_gain == 0) & (avg_loss == 0), 50.0)
     rsi = rsi.mask((avg_gain > 0) & (avg_loss == 0), 100.0)
     rsi = rsi.mask((avg_gain == 0) & (avg_loss > 0), 0.0)
-    out[f"RSI{RSI_PERIOD}"] = rsi
+    out[f"RSI{RSI_PERIOD}"] = rsi.map(round_half_up_1)
 
     for period in MA_PERIODS:
-        out[f"MA{period}"] = close.rolling(window=period, min_periods=period).mean()
+        ma = close.rolling(window=period, min_periods=period).mean()
+        out[f"MA{period}"] = ma.map(round_half_up_1)
 
     return out
 
