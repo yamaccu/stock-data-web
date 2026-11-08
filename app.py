@@ -1,211 +1,142 @@
 from __future__ import annotations
 
 import re
-import zipfile
-from decimal import Decimal, ROUND_HALF_UP
-from io import BytesIO
 
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
+from plotly.subplots import make_subplots
 
-APP_TITLE = "株価データ取得"
-DAILY_PERIOD = "1y"
-HOURLY_PERIOD = "60d"
-RSI_PERIOD = 14
+st.set_page_config(page_title="株価チャート", page_icon="📈", layout="wide")
 MA_PERIODS = (5, 25, 75)
+UP_COLOR = "#d9534f"
+DOWN_COLOR = "#2476ad"
 
-st.set_page_config(page_title=APP_TITLE, page_icon="📈", layout="centered")
 
-
-def normalize_ticker(code: str) -> tuple[str, str]:
+def normalize_ticker(code: str) -> str:
     raw = code.strip().upper().replace(" ", "")
     if not raw:
         raise ValueError("銘柄コードを入力してください。")
-
-    if re.fullmatch(r"[0-9A-Z]{4}", raw):
-        return raw, f"{raw}.T"
-
-    return raw, raw
-
-
-def round_half_up_1(value: float) -> float:
-    """小数点第2位以下を四捨五入し、小数点第1位までのfloatにする。"""
-    if pd.isna(value):
-        return value
-    return float(Decimal(str(value)).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP))
-
-
-def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """終値からRSI(14)と単純移動平均(5/25/75)を計算して追加する。"""
-    out = df.copy()
-    close = out["Close"]
-
-    # Wilder方式のRSI（14期間）
-    delta = close.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-
-    avg_gain = gain.ewm(alpha=1 / RSI_PERIOD, adjust=False, min_periods=RSI_PERIOD).mean()
-    avg_loss = loss.ewm(alpha=1 / RSI_PERIOD, adjust=False, min_periods=RSI_PERIOD).mean()
-
-    rs = avg_gain / avg_loss
-    rsi = 100 - (100 / (1 + rs))
-
-    # 値動きがない場合などのゼロ除算を明示的に処理
-    rsi = rsi.mask((avg_gain == 0) & (avg_loss == 0), 50.0)
-    rsi = rsi.mask((avg_gain > 0) & (avg_loss == 0), 100.0)
-    rsi = rsi.mask((avg_gain == 0) & (avg_loss > 0), 0.0)
-    out[f"RSI{RSI_PERIOD}"] = rsi.map(round_half_up_1)
-
-    for period in MA_PERIODS:
-        ma = close.rolling(window=period, min_periods=period).mean()
-        out[f"MA{period}"] = ma.map(round_half_up_1)
-
-    return out
-
-
-def prepare_ohlcv(df: pd.DataFrame, interval: str) -> pd.DataFrame:
-    if df.empty:
-        raise ValueError(
-            "株価データを取得できませんでした。"
-            "銘柄コードまたはYahoo Finance側のデータ提供状況を確認してください。"
-        )
-
-    required = ["Open", "High", "Low", "Close", "Volume"]
-    missing = [col for col in required if col not in df.columns]
-    if missing:
-        raise ValueError(f"必要な列がありません: {', '.join(missing)}")
-
-    out = df[required].copy()
-    out = out.dropna(subset=["Open", "High", "Low", "Close"], how="all")
-    out = add_technical_indicators(out)
-
-    idx = pd.DatetimeIndex(out.index)
-
-    if interval == "1h" and idx.tz is not None:
-        idx = idx.tz_convert("Asia/Tokyo").tz_localize(None)
-    elif idx.tz is not None:
-        idx = idx.tz_localize(None)
-
-    out.index = idx
-
-    if interval == "1d":
-        out.index.name = "Date"
-        out = out.reset_index()
-        out["Date"] = pd.to_datetime(out["Date"]).dt.strftime("%Y-%m-%d")
-    else:
-        out.index.name = "Datetime"
-        out = out.reset_index()
-        out["Datetime"] = pd.to_datetime(out["Datetime"]).dt.strftime("%Y-%m-%d %H:%M")
-
-    return out
+    return f"{raw}.T" if re.fullmatch(r"[0-9A-Z]{4}", raw) else raw
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def fetch_stock_data(code: str):
-    file_code, ticker_symbol = normalize_ticker(code)
-    ticker = yf.Ticker(ticker_symbol)
+def fetch_stock_data(symbol: str) -> pd.DataFrame:
+    # 75日線を表示初日から計算するため、内部では1年分取得。
+    raw = yf.Ticker(symbol).history(
+        period="1y", interval="1d", auto_adjust=False,
+        actions=False, prepost=False, timeout=20,
+    )
+    if raw.empty:
+        raise ValueError("株価データを取得できません。銘柄コードやデータ提供状況を確認してください。")
 
-    daily_raw = ticker.history(
-        period=DAILY_PERIOD,
-        interval="1d",
-        auto_adjust=False,
-        actions=False,
-        prepost=False,
-        timeout=20,
+    required = ["Open", "High", "Low", "Close", "Volume"]
+    missing = [name for name in required if name not in raw.columns]
+    if missing:
+        raise ValueError(f"必要な列がありません: {', '.join(missing)}")
+
+    df = raw[required].dropna(subset=["Open", "High", "Low", "Close"]).copy()
+    if df.empty:
+        raise ValueError("表示できる日足データがありません。")
+
+    dates = pd.DatetimeIndex(df.index)
+    df.index = (dates.tz_localize(None) if dates.tz is not None else dates).normalize()
+    df = df.sort_index().loc[lambda x: ~x.index.duplicated(keep="last")]
+    for period in MA_PERIODS:
+        df[f"MA{period}"] = df["Close"].rolling(period, min_periods=period).mean()
+    return df
+
+
+def build_chart(df: pd.DataFrame) -> go.Figure:
+    x = df.index.strftime("%Y-%m-%d").tolist()
+    colors = [
+        UP_COLOR if close >= open_ else DOWN_COLOR
+        for open_, close in zip(df["Open"], df["Close"])
+    ]
+    fig = make_subplots(
+        rows=2, cols=1, shared_xaxes=True,
+        row_heights=[0.76, 0.24], vertical_spacing=0.04,
+    )
+    fig.add_trace(
+        go.Candlestick(
+            x=x, open=df["Open"], high=df["High"],
+            low=df["Low"], close=df["Close"], name="日足",
+            increasing_line_color=UP_COLOR, decreasing_line_color=DOWN_COLOR,
+            increasing_fillcolor=UP_COLOR, decreasing_fillcolor=DOWN_COLOR,
+        ),
+        row=1, col=1,
+    )
+    ma_colors = {5: "#e69f00", 25: "#2b8cbe", 75: "#3c9d5d"}
+    for period in MA_PERIODS:
+        fig.add_trace(
+            go.Scatter(
+                x=x, y=df[f"MA{period}"], mode="lines",
+                name=f"MA{period}", line=dict(color=ma_colors[period], width=2),
+            ),
+            row=1, col=1,
+        )
+    fig.add_trace(
+        go.Bar(
+            x=x, y=df["Volume"], name="出来高",
+            marker_color=colors, showlegend=False,
+            hovertemplate="%{y:,.0f}<extra>出来高</extra>",
+        ),
+        row=2, col=1,
     )
 
-    hourly_raw = ticker.history(
-        period=HOURLY_PERIOD,
-        interval="1h",
-        auto_adjust=False,
-        actions=False,
-        prepost=False,
-        timeout=20,
+    # 休場日の空白をなくし、実際の取引日のみ等間隔で配置する。
+    step = max(1, len(x) // 8)
+    ticks = x[::step]
+    fig.update_xaxes(type="category", showgrid=False)
+    fig.update_xaxes(showticklabels=False, row=1, col=1)
+    fig.update_xaxes(
+        tickmode="array", tickvals=ticks,
+        ticktext=[date[5:] for date in ticks],
+        title_text="日付（月/日）", row=2, col=1,
     )
-
-    daily = prepare_ohlcv(daily_raw, "1d")
-    hourly = prepare_ohlcv(hourly_raw, "1h")
-
-    return daily, hourly, file_code, ticker_symbol
-
-
-def dataframe_to_csv_bytes(df: pd.DataFrame) -> bytes:
-    return df.to_csv(index=False).encode("utf-8-sig")
-
-
-def create_zip_bytes(
-    daily: pd.DataFrame,
-    hourly: pd.DataFrame,
-    file_code: str,
-) -> bytes:
-    """日足CSVと1時間足CSVを1つのZIPにまとめる。"""
-    buffer = BytesIO()
-
-    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr(
-            f"{file_code}_daily.csv",
-            dataframe_to_csv_bytes(daily),
-        )
-        zf.writestr(
-            f"{file_code}_1h.csv",
-            dataframe_to_csv_bytes(hourly),
-        )
-
-    buffer.seek(0)
-    return buffer.getvalue()
+    fig.update_yaxes(title_text="株価", tickformat=",", row=1, col=1)
+    fig.update_yaxes(title_text="出来高", tickformat="~s", row=2, col=1)
+    fig.update_layout(
+        template="plotly_white", height=690,
+        margin=dict(l=30, r=20, t=65, b=25),
+        hovermode="x unified", dragmode="zoom",
+        xaxis_rangeslider_visible=False,
+        legend=dict(orientation="h", yanchor="bottom", y=1.01, x=0),
+    )
+    return fig
 
 
-st.title("📈 株価データ取得")
-st.caption("銘柄コードを入力すると、日足と1時間足のCSVを作成します。")
-
+st.title("📈 株価チャート")
+st.caption("直近4か月の日足・5日/25日/75日移動平均線・出来高を表示します。")
 with st.form("stock_form"):
     code = st.text_input(
-        "銘柄コード",
-        placeholder="例: 7186",
-        help="日本株の4文字コードは自動で .T を付けます。^N225 / GC=F / BTC-USD なども入力できます。",
+        "銘柄コード", placeholder="例: 7186",
+        help="日本株の4文字コードには自動で .T を付けます。^N225 / GC=F / BTC-USD なども指定できます。",
     )
-
     submitted = st.form_submit_button(
-        "日足・1時間足を取得",
-        use_container_width=True,
-        type="primary",
+        "チャートを表示", use_container_width=True, type="primary",
     )
 
 if submitted:
     try:
+        symbol = normalize_ticker(code)
         with st.spinner("株価データを取得しています..."):
-            daily, hourly, file_code, ticker_symbol = fetch_stock_data(code)
-
-        st.success(
-            f"{ticker_symbol} の取得が完了しました。"
-            f" 日足 {len(daily):,}行 / 1時間足 {len(hourly):,}行"
+            data = fetch_stock_data(symbol)
+        start = data.index.max() - pd.DateOffset(months=4)
+        chart_data = data.loc[data.index >= start]
+        if chart_data.empty:
+            raise ValueError("表示期間内に株価データがありません。")
+        st.subheader(symbol)
+        st.caption(
+            f"表示期間: {chart_data.index.min():%Y/%m/%d} ～ "
+            f"{chart_data.index.max():%Y/%m/%d}（{len(chart_data)}営業日）"
         )
-
-        zip_data = create_zip_bytes(daily, hourly, file_code)
-
-        st.download_button(
-            "日足・1時間足CSVをまとめてダウンロード",
-            data=zip_data,
-            file_name=f"{file_code}_stock_data.zip",
-            mime="application/zip",
-            use_container_width=True,
-            type="primary",
-        )
-
-        with st.expander("取得データを確認"):
-            st.markdown("**日足（末尾10行）**")
-            st.dataframe(daily.tail(10), use_container_width=True, hide_index=True)
-
-            st.markdown("**1時間足（末尾10行）**")
-            st.dataframe(hourly.tail(10), use_container_width=True, hide_index=True)
-
+        st.plotly_chart(build_chart(chart_data), use_container_width=True)
+        if chart_data["MA75"].isna().all():
+            st.info("過去データが75営業日未満のため、75日移動平均線は表示されません。")
     except Exception as exc:
-        st.error(f"データ取得に失敗しました。\n\n{exc}")
+        st.error(f"チャート表示に失敗しました。\n\n{exc}")
 
 st.divider()
-st.caption(
-    "日足: 直近1年 / 1時間足: 直近60日 / "
-    "CSV列: Date(Datetime), Open, High, Low, Close, Volume, RSI14, MA5, MA25, MA75"
-)
+st.caption("データ提供: Yahoo Finance / 取得結果は5分間キャッシュされます。")
