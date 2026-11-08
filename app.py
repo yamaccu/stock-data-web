@@ -159,12 +159,11 @@ def fetch_stock_data(symbol: str) -> pd.DataFrame:
 def add_trade_markers(
     fig: go.Figure, chart_data: pd.DataFrame, trades: pd.DataFrame
 ) -> None:
-    """Draw quantities inside triangles, without displaying execution prices."""
-    # Put buy markers below each daily candle and sell markers above it.
-    # This keeps both visible when buy and sell executions occur on the same day.
+    """Show compact buy/sell triangles without quantity or price labels."""
+    # Buy markers sit just below the candle, sell markers just above it.
     price_span = float(chart_data["High"].max() - chart_data["Low"].min())
     median_close = float(chart_data["Close"].median())
-    padding = max(price_span * 0.05, abs(median_close) * 0.005, 0.01)
+    padding = max(price_span * 0.015, abs(median_close) * 0.001, 0.01)
 
     for side, label, symbol, color in (
         ("buy", "買い", "triangle-up", "#c62828"),
@@ -181,27 +180,17 @@ def add_trade_markers(
             else float(chart_data.loc[date, "High"] + padding)
             for date in events["Date"]
         ]
-        quantities = [f"{int(quantity):,}" for quantity in events["Quantity"]]
-        sizes = [min(90, max(64, 42 + 6 * len(q))) for q in quantities]
         fig.add_trace(
             go.Scatter(
                 x=x_values,
                 y=marker_y,
-                mode="markers+text",
-                name=f"{label}（数量）",
+                mode="markers",
+                name=label,
                 marker=dict(
-                    symbol=symbol, size=sizes, color=color,
+                    symbol=symbol, size=14, color=color,
                     line=dict(color="white", width=1),
                 ),
-                text=quantities,
-                textposition="middle center",
-                textfont=dict(size=10, color="white", family="Arial Black"),
-                cliponaxis=False,
-                customdata=events["Fills"].tolist(),
-                hovertemplate=(
-                    f"{label}: <b>%{{text}}</b><br>"
-                    "約定件数: %{customdata}件<extra></extra>"
-                ),
+                hovertemplate=f"{label}<extra></extra>",
             ),
             row=1, col=1,
         )
