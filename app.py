@@ -11,6 +11,8 @@ from plotly.subplots import make_subplots
 st.set_page_config(page_title="株価チャート", page_icon="📈", layout="wide")
 
 MA_PERIODS = (5, 25, 75)
+CHART_MONTHS = 6
+INITIAL_VIEW_MONTHS = 3
 RSI_PERIOD = 14
 ADX_PERIOD = 14
 UP_COLOR = "#d9534f"
@@ -151,8 +153,9 @@ def fetch_stock_data(symbol: str) -> pd.DataFrame:
     return add_technical_indicators(df)
 
 
-def build_chart(df: pd.DataFrame) -> go.Figure:
+def build_chart(df: pd.DataFrame, initial_start: pd.Timestamp) -> go.Figure:
     x = df.index.strftime("%Y-%m-%d").tolist()
+    first_visible_index = int(df.index.searchsorted(initial_start, side="left"))
     volume_colors = [
         UP_COLOR if close >= open_ else DOWN_COLOR
         for open_, close in zip(df["Open"], df["Close"])
@@ -231,7 +234,13 @@ def build_chart(df: pd.DataFrame) -> go.Figure:
     # 休場日は空白を作らず、営業日を等間隔に配置する。
     step = max(1, len(x) // 8)
     ticks = x[::step]
-    fig.update_xaxes(type="category", showgrid=False)
+    # 6か月分を保持しつつ、初期表示は直近3か月に限定する。
+    # category軸のrangeは、日付文字列ではなくカテゴリの位置（0始まり）で指定する。
+    fig.update_xaxes(
+        type="category",
+        range=[first_visible_index - 0.5, len(x) - 0.5],
+        showgrid=False,
+    )
     for row in (1, 2, 3):
         fig.update_xaxes(showticklabels=False, row=row, col=1)
     fig.update_xaxes(
@@ -246,7 +255,7 @@ def build_chart(df: pd.DataFrame) -> go.Figure:
     fig.update_layout(
         template="plotly_white", height=960,
         margin=dict(l=35, r=20, t=90, b=25),
-        hovermode="x unified", dragmode="zoom",
+        hovermode="x unified", dragmode="pan",
         xaxis_rangeslider_visible=False,
         legend=dict(orientation="h", yanchor="bottom", y=1.03, x=0),
     )
@@ -254,7 +263,7 @@ def build_chart(df: pd.DataFrame) -> go.Figure:
 
 
 st.title("📈 株価チャート")
-st.caption("直近4か月の日足・移動平均（5/25/75）・出来高・RSI14・ADX14・+DI14・-DI14")
+st.caption("半年分の日足を描画し、直近3か月を初期表示します。横方向にドラッグすると過去のチャートを見られます。")
 with st.form("stock_form"):
     code = st.text_input(
         "銘柄コード", placeholder="例: 7186",
@@ -270,8 +279,10 @@ if submitted:
         with st.spinner("株価データを取得しています..."):
             data = fetch_stock_data(symbol)
 
-        # 表示する範囲は直近4か月。テクニカル指標は過去1年から算出済み。
-        start = data.index.max() - pd.DateOffset(months=4)
+        # 過去1年から指標を計算し、直近6か月分を描画。初期表示は3か月。
+        latest_date = data.index.max()
+        start = latest_date - pd.DateOffset(months=CHART_MONTHS)
+        initial_start = latest_date - pd.DateOffset(months=INITIAL_VIEW_MONTHS)
         chart_data = data.loc[data.index >= start]
         if chart_data.empty:
             raise ValueError("表示期間内に株価データがありません。")
@@ -279,10 +290,11 @@ if submitted:
         name = fetch_ticker_name(symbol)
         st.subheader(f"{symbol}  {name}" if name else symbol)
         st.caption(
-            f"表示期間: {chart_data.index.min():%Y/%m/%d} ～ "
-            f"{chart_data.index.max():%Y/%m/%d}（{len(chart_data)}営業日）"
+            f"描画期間: {chart_data.index.min():%Y/%m/%d} ～ "
+            f"{chart_data.index.max():%Y/%m/%d}（{len(chart_data)}営業日） / "
+            f"初期表示: 直近{INITIAL_VIEW_MONTHS}か月 / Panで過去に移動できます"
         )
-        st.plotly_chart(build_chart(chart_data), use_container_width=True)
+        st.plotly_chart(build_chart(chart_data, initial_start), use_container_width=True)
 
         if chart_data["MA75"].isna().all():
             st.info("過去データが75営業日未満のため、75日移動平均線は表示されません。")
