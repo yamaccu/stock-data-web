@@ -157,13 +157,9 @@ def fetch_stock_data(symbol: str) -> pd.DataFrame:
 
 
 def add_trade_markers(
-    fig: go.Figure, chart_data: pd.DataFrame, trades: pd.DataFrame
+    fig: go.Figure, trades: pd.DataFrame
 ) -> None:
-    """Show compact buy/sell triangles without quantity or price labels."""
-    # Buy markers sit just below the candle, sell markers just above it.
-    price_span = float(chart_data["High"].max() - chart_data["Low"].min())
-    median_close = float(chart_data["Close"].median())
-    padding = max(price_span * 0.015, abs(median_close) * 0.001, 0.01)
+    """Place compact trade markers at the actual execution prices."""
 
     for side, label, symbol, color in (
         ("buy", "買い", "triangle-up", "#c62828"),
@@ -174,12 +170,9 @@ def add_trade_markers(
             continue
 
         x_values = events["Date"].dt.strftime("%Y-%m-%d").tolist()
-        marker_y = [
-            float(chart_data.loc[date, "Low"] - padding)
-            if side == "buy"
-            else float(chart_data.loc[date, "High"] + padding)
-            for date in events["Date"]
-        ]
+        # On multiple fills in the same direction and date, Price is the
+        # quantity-weighted execution price calculated by aggregate_chart_trades.
+        marker_y = events["Price"].tolist()
         fig.add_trace(
             go.Scatter(
                 x=x_values,
@@ -277,7 +270,7 @@ def build_chart(
     )
 
     if trades is not None and not trades.empty:
-        add_trade_markers(fig, df, trades)
+        add_trade_markers(fig, trades)
 
     # 休場日は空白を作らず、営業日を等間隔に配置する。
     step = max(1, len(x) // 8)
