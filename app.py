@@ -9,7 +9,10 @@ import yfinance as yf
 from plotly.subplots import make_subplots
 
 st.set_page_config(page_title="株価チャート", page_icon="📈", layout="wide")
+
 MA_PERIODS = (5, 25, 75)
+RSI_PERIOD = 14
+ADX_PERIOD = 14
 UP_COLOR = "#d9534f"
 DOWN_COLOR = "#2476ad"
 
@@ -21,9 +24,111 @@ def normalize_ticker(code: str) -> str:
     return f"{raw}.T" if re.fullmatch(r"[0-9A-Z]{4}", raw) else raw
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_ticker_name(symbol: str) -> str:
+    """名称取得に失敗しても、株価チャートの表示は妨げない。"""
+    try:
+        info = yf.Ticker(symbol).get_info()
+        if isinstance(info, dict):
+            for key in ("longName", "shortName", "displayName"):
+                name = info.get(key)
+                if isinstance(name, str) and name.strip():
+                    return name.strip()
+    except Exception:
+        pass
+    return ""
+
+
+def calculate_directional_indicators(
+    data: pd.DataFrame, period: int = ADX_PERIOD
+) -> pd.DataFrame:
+    """marketdataと同じWilder方式でADX、+DI、-DIを計算する。"""
+    high = data["High"]
+    low = data["Low"]
+    close = data["Close"]
+
+    up_move = high.diff()
+    down_move = -low.diff()
+    plus_dm = up_move.where(
+        (up_move > down_move) & (up_move > 0), 0.0
+    )
+    minus_dm = down_move.where(
+        (down_move > up_move) & (down_move > 0), 0.0
+    )
+
+    true_range = pd.concat(
+        [
+            high - low,
+            (high - close.shift(1)).abs(),
+            (low - close.shift(1)).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+
+    def wilder_average(values: pd.Series, start: int) -> pd.Series:
+        """初回は単純平均、以降はWilder平滑化。"""
+        average = pd.Series(float("nan"), index=values.index)
+        first = start + period - 1
+        if len(values) <= first:
+            return average
+
+        average.iloc[first] = values.iloc[start:first + 1].mean()
+        for i in range(first + 1, len(values)):
+            average.iloc[i] = (
+                average.iloc[i - 1] * (period - 1) + values.iloc[i]
+            ) / period
+        return average
+
+    smoothed_tr = wilder_average(true_range, start=1)
+    plus_di = 100 * wilder_average(plus_dm, start=1) / smoothed_tr
+    minus_di = 100 * wilder_average(minus_dm, start=1) / smoothed_tr
+
+    di_sum = (plus_di + minus_di).replace(0, float("nan"))
+    dx = (100 * (plus_di - minus_di).abs() / di_sum).fillna(0.0)
+    return pd.DataFrame(
+        {
+            f"ADX{period}": wilder_average(dx, start=period),
+            f"+DI{period}": plus_di,
+            f"-DI{period}": minus_di,
+        },
+        index=data.index,
+    )
+
+
+def add_technical_indicators(data: pd.DataFrame) -> pd.DataFrame:
+    """移動平均と、marketdataと同方式のRSI/ADX/DIを計算する。"""
+    result = data.copy()
+    close = result["Close"]
+
+    for period in MA_PERIODS:
+        result[f"MA{period}"] = close.rolling(
+            window=period, min_periods=period
+        ).mean()
+
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(
+        alpha=1 / RSI_PERIOD, adjust=False, min_periods=RSI_PERIOD
+    ).mean()
+    avg_loss = loss.ewm(
+        alpha=1 / RSI_PERIOD, adjust=False, min_periods=RSI_PERIOD
+    ).mean()
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+    rsi = rsi.mask((avg_gain == 0) & (avg_loss == 0), 50.0)
+    rsi = rsi.mask((avg_gain > 0) & (avg_loss == 0), 100.0)
+    rsi = rsi.mask((avg_gain == 0) & (avg_loss > 0), 0.0)
+    result[f"RSI{RSI_PERIOD}"] = rsi
+
+    directional = calculate_directional_indicators(result)
+    result[directional.columns] = directional
+    return result
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_stock_data(symbol: str) -> pd.DataFrame:
-    # 75日線を表示初日から計算するため、内部では1年分取得。
+    # 表示開始時点から75日線やADXを計算するため、過去1年分を取得。
     raw = yf.Ticker(symbol).history(
         period="1y", interval="1d", auto_adjust=False,
         actions=False, prepost=False, timeout=20,
@@ -43,27 +148,29 @@ def fetch_stock_data(symbol: str) -> pd.DataFrame:
     dates = pd.DatetimeIndex(df.index)
     df.index = (dates.tz_localize(None) if dates.tz is not None else dates).normalize()
     df = df.sort_index().loc[lambda x: ~x.index.duplicated(keep="last")]
-    for period in MA_PERIODS:
-        df[f"MA{period}"] = df["Close"].rolling(period, min_periods=period).mean()
-    return df
+    return add_technical_indicators(df)
 
 
 def build_chart(df: pd.DataFrame) -> go.Figure:
     x = df.index.strftime("%Y-%m-%d").tolist()
-    colors = [
+    volume_colors = [
         UP_COLOR if close >= open_ else DOWN_COLOR
         for open_, close in zip(df["Open"], df["Close"])
     ]
     fig = make_subplots(
-        rows=2, cols=1, shared_xaxes=True,
-        row_heights=[0.76, 0.24], vertical_spacing=0.04,
+        rows=4, cols=1, shared_xaxes=True,
+        row_heights=[0.50, 0.16, 0.17, 0.17],
+        vertical_spacing=0.035,
     )
+
     fig.add_trace(
         go.Candlestick(
             x=x, open=df["Open"], high=df["High"],
             low=df["Low"], close=df["Close"], name="日足",
-            increasing_line_color=UP_COLOR, decreasing_line_color=DOWN_COLOR,
-            increasing_fillcolor=UP_COLOR, decreasing_fillcolor=DOWN_COLOR,
+            increasing_line_color=UP_COLOR,
+            decreasing_line_color=DOWN_COLOR,
+            increasing_fillcolor=UP_COLOR,
+            decreasing_fillcolor=DOWN_COLOR,
         ),
         row=1, col=1,
     )
@@ -72,43 +179,82 @@ def build_chart(df: pd.DataFrame) -> go.Figure:
         fig.add_trace(
             go.Scatter(
                 x=x, y=df[f"MA{period}"], mode="lines",
-                name=f"MA{period}", line=dict(color=ma_colors[period], width=2),
+                name=f"MA{period}",
+                line=dict(color=ma_colors[period], width=2),
+                hovertemplate="%{y:,.1f}<extra>%{fullData.name}</extra>",
             ),
             row=1, col=1,
         )
+
     fig.add_trace(
         go.Bar(
             x=x, y=df["Volume"], name="出来高",
-            marker_color=colors, showlegend=False,
+            marker_color=volume_colors, showlegend=False,
             hovertemplate="%{y:,.0f}<extra>出来高</extra>",
         ),
         row=2, col=1,
     )
 
-    # 休場日の空白をなくし、実際の取引日のみ等間隔で配置する。
+    fig.add_trace(
+        go.Scatter(
+            x=x, y=df["RSI14"], mode="lines",
+            name="RSI14", line=dict(color="#7957b3", width=2),
+            hovertemplate="%{y:.1f}<extra>RSI14</extra>",
+        ),
+        row=3, col=1,
+    )
+    for level in (30, 70):
+        fig.add_hline(
+            y=level, line_dash="dash", line_color="#999999",
+            line_width=1, row=3, col=1,
+        )
+
+    di_colors = {
+        "ADX14": "#7351ae",
+        "+DI14": "#13866b",
+        "-DI14": "#d14a57",
+    }
+    for name, color in di_colors.items():
+        fig.add_trace(
+            go.Scatter(
+                x=x, y=df[name], mode="lines", name=name,
+                line=dict(color=color, width=2),
+                hovertemplate="%{y:.1f}<extra>%{fullData.name}</extra>",
+            ),
+            row=4, col=1,
+        )
+    fig.add_hline(
+        y=25, line_dash="dash", line_color="#999999",
+        line_width=1, row=4, col=1,
+    )
+
+    # 休場日は空白を作らず、営業日を等間隔に配置する。
     step = max(1, len(x) // 8)
     ticks = x[::step]
     fig.update_xaxes(type="category", showgrid=False)
-    fig.update_xaxes(showticklabels=False, row=1, col=1)
+    for row in (1, 2, 3):
+        fig.update_xaxes(showticklabels=False, row=row, col=1)
     fig.update_xaxes(
         tickmode="array", tickvals=ticks,
         ticktext=[date[5:] for date in ticks],
-        title_text="日付（月/日）", row=2, col=1,
+        title_text="日付（月/日）", row=4, col=1,
     )
     fig.update_yaxes(title_text="株価", tickformat=",", row=1, col=1)
     fig.update_yaxes(title_text="出来高", tickformat="~s", row=2, col=1)
+    fig.update_yaxes(title_text="RSI", range=[0, 100], row=3, col=1)
+    fig.update_yaxes(title_text="ADX / DI", rangemode="tozero", row=4, col=1)
     fig.update_layout(
-        template="plotly_white", height=690,
-        margin=dict(l=30, r=20, t=65, b=25),
+        template="plotly_white", height=960,
+        margin=dict(l=35, r=20, t=90, b=25),
         hovermode="x unified", dragmode="zoom",
         xaxis_rangeslider_visible=False,
-        legend=dict(orientation="h", yanchor="bottom", y=1.01, x=0),
+        legend=dict(orientation="h", yanchor="bottom", y=1.03, x=0),
     )
     return fig
 
 
 st.title("📈 株価チャート")
-st.caption("直近4か月の日足・5日/25日/75日移動平均線・出来高を表示します。")
+st.caption("直近4か月の日足・移動平均（5/25/75）・出来高・RSI14・ADX14・+DI14・-DI14")
 with st.form("stock_form"):
     code = st.text_input(
         "銘柄コード", placeholder="例: 7186",
@@ -123,20 +269,27 @@ if submitted:
         symbol = normalize_ticker(code)
         with st.spinner("株価データを取得しています..."):
             data = fetch_stock_data(symbol)
+
+        # 表示する範囲は直近4か月。テクニカル指標は過去1年から算出済み。
         start = data.index.max() - pd.DateOffset(months=4)
         chart_data = data.loc[data.index >= start]
         if chart_data.empty:
             raise ValueError("表示期間内に株価データがありません。")
-        st.subheader(symbol)
+
+        name = fetch_ticker_name(symbol)
+        st.subheader(f"{symbol}  {name}" if name else symbol)
         st.caption(
             f"表示期間: {chart_data.index.min():%Y/%m/%d} ～ "
             f"{chart_data.index.max():%Y/%m/%d}（{len(chart_data)}営業日）"
         )
         st.plotly_chart(build_chart(chart_data), use_container_width=True)
+
         if chart_data["MA75"].isna().all():
             st.info("過去データが75営業日未満のため、75日移動平均線は表示されません。")
+        if chart_data["ADX14"].isna().all():
+            st.info("過去データが少ないため、ADXはまだ計算できません。")
     except Exception as exc:
         st.error(f"チャート表示に失敗しました。\n\n{exc}")
 
 st.divider()
-st.caption("データ提供: Yahoo Finance / 取得結果は5分間キャッシュされます。")
+st.caption("データ提供: Yahoo Finance / 株価取得は5分間、銘柄名は1時間キャッシュされます。")
