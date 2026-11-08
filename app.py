@@ -180,7 +180,7 @@ def add_trade_markers(
                 mode="markers",
                 name=label,
                 marker=dict(
-                    symbol=symbol, size=14, color=color,
+                    symbol=symbol, size=11, color=color,
                     line=dict(color="white", width=1),
                 ),
                 customdata=events["Price"].tolist(),
@@ -304,7 +304,6 @@ def build_chart(
 
 
 st.title("📈 株価チャート")
-st.caption("半年分の日足を描画、直近3か月を初期表示します。楽天証券CSVを指定すると買い▲・売り▼に数量を重ねます。")
 with st.form("stock_form"):
     code = st.text_input(
         "銘柄コード", placeholder="例: 7186",
@@ -335,11 +334,6 @@ if submitted:
 
         name = fetch_ticker_name(symbol)
         st.subheader(f"{symbol}  {name}" if name else symbol)
-        st.caption(
-            f"描画期間: {chart_data.index.min():%Y/%m/%d} ～ "
-            f"{chart_data.index.max():%Y/%m/%d}（{len(chart_data)}営業日） / "
-            f"初期表示: 直近{INITIAL_VIEW_MONTHS}か月 / Panで過去に移動できます"
-        )
         trade_events = None
         if trade_upload is not None:
             try:
@@ -347,12 +341,6 @@ if submitted:
                 trade_events = aggregate_chart_trades(trade_rows, symbol, chart_data.index)
                 if trade_events.empty:
                     st.info("アップロードしたCSVに、この銘柄の描画期間内の売買履歴はありません。")
-                else:
-                    fill_count = int(trade_events["Fills"].sum())
-                    st.caption(
-                        f"売買履歴: {fill_count}約定 / "
-                        f"{len(trade_events)}マーカー（同日・同方向は合算）"
-                    )
             except Exception as exc:
                 st.warning(f"売買履歴CSVを読み込めませんでした。チャートのみ表示します。\n\n{exc}")
 
