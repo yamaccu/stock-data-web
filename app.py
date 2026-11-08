@@ -190,7 +190,8 @@ def add_trade_markers(
                     symbol=symbol, size=14, color=color,
                     line=dict(color="white", width=1),
                 ),
-                hovertemplate=f"{label}<extra></extra>",
+                customdata=events["Price"].tolist(),
+                hovertemplate=f"{label}約定価格: %{{customdata:,.2f}}円<extra></extra>",
             ),
             row=1, col=1,
         )
