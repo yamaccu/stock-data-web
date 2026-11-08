@@ -8,6 +8,8 @@ import streamlit as st
 import yfinance as yf
 from plotly.subplots import make_subplots
 
+from trade_history import aggregate_chart_trades, read_trade_history
+
 st.set_page_config(page_title="株価チャート", page_icon="📈", layout="wide")
 
 MA_PERIODS = (5, 25, 75)
@@ -153,7 +155,60 @@ def fetch_stock_data(symbol: str) -> pd.DataFrame:
     return add_technical_indicators(df)
 
 
-def build_chart(df: pd.DataFrame, initial_start: pd.Timestamp) -> go.Figure:
+
+def add_trade_markers(
+    fig: go.Figure, chart_data: pd.DataFrame, trades: pd.DataFrame
+) -> None:
+    """Draw quantities inside triangles, without displaying execution prices."""
+    # Put buy markers below each daily candle and sell markers above it.
+    # This keeps both visible when buy and sell executions occur on the same day.
+    price_span = float(chart_data["High"].max() - chart_data["Low"].min())
+    median_close = float(chart_data["Close"].median())
+    padding = max(price_span * 0.05, abs(median_close) * 0.005, 0.01)
+
+    for side, label, symbol, color in (
+        ("buy", "買い", "triangle-up", "#c62828"),
+        ("sell", "売り", "triangle-down", "#1565c0"),
+    ):
+        events = trades.loc[trades["Side"].eq(side)]
+        if events.empty:
+            continue
+
+        x_values = events["Date"].dt.strftime("%Y-%m-%d").tolist()
+        marker_y = [
+            float(chart_data.loc[date, "Low"] - padding)
+            if side == "buy"
+            else float(chart_data.loc[date, "High"] + padding)
+            for date in events["Date"]
+        ]
+        quantities = [f"{int(quantity):,}" for quantity in events["Quantity"]]
+        sizes = [min(90, max(64, 42 + 6 * len(q))) for q in quantities]
+        fig.add_trace(
+            go.Scatter(
+                x=x_values,
+                y=marker_y,
+                mode="markers+text",
+                name=f"{label}（数量）",
+                marker=dict(
+                    symbol=symbol, size=sizes, color=color,
+                    line=dict(color="white", width=1),
+                ),
+                text=quantities,
+                textposition="middle center",
+                textfont=dict(size=10, color="white", family="Arial Black"),
+                cliponaxis=False,
+                customdata=events["Fills"].tolist(),
+                hovertemplate=(
+                    f"{label}: <b>%{{text}}</b><br>"
+                    "約定件数: %{customdata}件<extra></extra>"
+                ),
+            ),
+            row=1, col=1,
+        )
+
+def build_chart(
+    df: pd.DataFrame, initial_start: pd.Timestamp, trades: pd.DataFrame | None = None
+) -> go.Figure:
     x = df.index.strftime("%Y-%m-%d").tolist()
     first_visible_index = int(df.index.searchsorted(initial_start, side="left"))
     volume_colors = [
@@ -231,6 +286,9 @@ def build_chart(df: pd.DataFrame, initial_start: pd.Timestamp) -> go.Figure:
         line_width=1, row=4, col=1,
     )
 
+    if trades is not None and not trades.empty:
+        add_trade_markers(fig, df, trades)
+
     # 休場日は空白を作らず、営業日を等間隔に配置する。
     step = max(1, len(x) // 8)
     ticks = x[::step]
@@ -263,11 +321,16 @@ def build_chart(df: pd.DataFrame, initial_start: pd.Timestamp) -> go.Figure:
 
 
 st.title("📈 株価チャート")
-st.caption("半年分の日足を描画し、直近3か月を初期表示します。横方向にドラッグすると過去のチャートを見られます。")
+st.caption("半年分の日足を描画、直近3か月を初期表示します。楽天証券CSVを指定すると買い▲・売り▼に数量を重ねます。")
 with st.form("stock_form"):
     code = st.text_input(
         "銘柄コード", placeholder="例: 7186",
         help="日本株の4文字コードには自動で .T を付けます。^N225 / GC=F / BTC-USD なども指定できます。",
+    )
+    trade_upload = st.file_uploader(
+        "楽天証券の売買履歴CSV（任意）",
+        type=["csv"],
+        help="ファイルを指定しなければ、売買履歴なしでチャートを表示します。",
     )
     submitted = st.form_submit_button(
         "チャートを表示", use_container_width=True, type="primary",
@@ -294,7 +357,26 @@ if submitted:
             f"{chart_data.index.max():%Y/%m/%d}（{len(chart_data)}営業日） / "
             f"初期表示: 直近{INITIAL_VIEW_MONTHS}か月 / Panで過去に移動できます"
         )
-        st.plotly_chart(build_chart(chart_data, initial_start), use_container_width=True)
+        trade_events = None
+        if trade_upload is not None:
+            try:
+                trade_rows = read_trade_history(trade_upload.getvalue())
+                trade_events = aggregate_chart_trades(trade_rows, symbol, chart_data.index)
+                if trade_events.empty:
+                    st.info("アップロードしたCSVに、この銘柄の描画期間内の売買履歴はありません。")
+                else:
+                    fill_count = int(trade_events["Fills"].sum())
+                    st.caption(
+                        f"売買履歴: {fill_count}約定 / "
+                        f"{len(trade_events)}マーカー（同日・同方向は合算）"
+                    )
+            except Exception as exc:
+                st.warning(f"売買履歴CSVを読み込めませんでした。チャートのみ表示します。\n\n{exc}")
+
+        st.plotly_chart(
+            build_chart(chart_data, initial_start, trade_events),
+            use_container_width=True,
+        )
 
         if chart_data["MA75"].isna().all():
             st.info("過去データが75営業日未満のため、75日移動平均線は表示されません。")
