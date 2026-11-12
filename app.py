@@ -15,6 +15,8 @@ st.set_page_config(page_title="株価チャート", page_icon="📈", layout="wi
 MA_PERIODS = (5, 25, 75)
 CHART_MONTHS = 6
 INITIAL_VIEW_MONTHS = 3
+HOURLY_PERIOD = "60d"
+HOURLY_INITIAL_DAYS = 14
 RSI_PERIOD = 14
 ADX_PERIOD = 14
 UP_COLOR = "#d9534f"
@@ -131,10 +133,13 @@ def add_technical_indicators(data: pd.DataFrame) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def fetch_stock_data(symbol: str) -> pd.DataFrame:
-    # 表示開始時点から75日線やADXを計算するため、過去1年分を取得。
+def fetch_stock_data(symbol: str, interval: str = "1d") -> pd.DataFrame:
+    if interval not in ("1d", "1h"):
+        raise ValueError("未対応の足種です。")
+    # 日足は1年、1時間足は60日取得。指標を全期間から計算してから表示範囲を絞る。
+    period = "1y" if interval == "1d" else HOURLY_PERIOD
     raw = yf.Ticker(symbol).history(
-        period="1y", interval="1d", auto_adjust=False,
+        period=period, interval=interval, auto_adjust=False,
         actions=False, prepost=False, timeout=20,
     )
     if raw.empty:
@@ -150,7 +155,12 @@ def fetch_stock_data(symbol: str) -> pd.DataFrame:
         raise ValueError("表示できる日足データがありません。")
 
     dates = pd.DatetimeIndex(df.index)
-    df.index = (dates.tz_localize(None) if dates.tz is not None else dates).normalize()
+    if interval == "1h":
+        # 1時間足は時刻を残したまま日本時間へ統一する。
+        df.index = dates.tz_convert("Asia/Tokyo").tz_localize(None) if dates.tz is not None else dates
+    else:
+        # 日足の日付は取引所の現地日付をそのまま使う。
+        df.index = (dates.tz_localize(None) if dates.tz is not None else dates).normalize()
     df = df.sort_index().loc[lambda x: ~x.index.duplicated(keep="last")]
     return add_technical_indicators(df)
 
@@ -190,9 +200,13 @@ def add_trade_markers(
         )
 
 def build_chart(
-    df: pd.DataFrame, initial_start: pd.Timestamp, trades: pd.DataFrame | None = None
+    df: pd.DataFrame,
+    initial_start: pd.Timestamp,
+    trades: pd.DataFrame | None = None,
+    interval: str = "1d",
 ) -> go.Figure:
-    x = df.index.strftime("%Y-%m-%d").tolist()
+    is_hourly = interval == "1h"
+    x = df.index.strftime("%Y-%m-%d %H:%M" if is_hourly else "%Y-%m-%d").tolist()
     first_visible_index = int(df.index.searchsorted(initial_start, side="left"))
     volume_colors = [
         UP_COLOR if close >= open_ else DOWN_COLOR
@@ -207,7 +221,7 @@ def build_chart(
     fig.add_trace(
         go.Candlestick(
             x=x, open=df["Open"], high=df["High"],
-            low=df["Low"], close=df["Close"], name="日足",
+            low=df["Low"], close=df["Close"], name="1時間足" if is_hourly else "日足",
             increasing_line_color=UP_COLOR,
             decreasing_line_color=DOWN_COLOR,
             increasing_fillcolor=UP_COLOR,
@@ -269,14 +283,13 @@ def build_chart(
         line_width=1, row=4, col=1,
     )
 
-    if trades is not None and not trades.empty:
+    if not is_hourly and trades is not None and not trades.empty:
         add_trade_markers(fig, trades)
 
-    # 休場日は空白を作らず、営業日を等間隔に配置する。
-    step = max(1, len(x) // 8)
+    # 休場日・休場時間の空白を除いて、実際の取引足を等間隔で配置する。
+    step = max(1, len(x) // (4 if is_hourly else 8))
     ticks = x[::step]
-    # 6か月分を保持しつつ、初期表示は直近3か月に限定する。
-    # category軸のrangeは、日付文字列ではなくカテゴリの位置（0始まり）で指定する。
+    # category軸のrangeは日付文字列ではなくカテゴリの位置で指定する。
     fig.update_xaxes(
         type="category",
         range=[first_visible_index - 0.5, len(x) - 0.5],
@@ -287,7 +300,8 @@ def build_chart(
     fig.update_xaxes(
         tickmode="array", tickvals=ticks,
         ticktext=[date[5:] for date in ticks],
-        title_text="日付（月/日）", row=4, col=1,
+        title_text="日時（日本時間）" if is_hourly else "日付（月/日）",
+        row=4, col=1,
     )
     fig.update_yaxes(title_text="株価", tickformat=",", row=1, col=1)
     fig.update_yaxes(title_text="出来高", tickformat="~s", row=2, col=1)
@@ -344,10 +358,26 @@ if submitted:
             except Exception as exc:
                 st.warning(f"売買履歴CSVを読み込めませんでした。チャートのみ表示します。\n\n{exc}")
 
+        st.markdown("#### 日足")
         st.plotly_chart(
-            build_chart(chart_data, initial_start, trade_events),
+            build_chart(chart_data, initial_start, trade_events, interval="1d"),
             use_container_width=True,
         )
+
+        st.markdown("#### 1時間足")
+        try:
+            with st.spinner("1時間足を取得しています..."):
+                hourly_data = fetch_stock_data(symbol, interval="1h")
+            hourly_start = hourly_data.index.max() - pd.Timedelta(days=HOURLY_INITIAL_DAYS)
+            st.plotly_chart(
+                build_chart(hourly_data, hourly_start, interval="1h"),
+                use_container_width=True,
+            )
+        except Exception as exc:
+            st.warning(
+                "1時間足は取得できませんでした。日足はそのまま表示しています。"
+                f"\n\n{exc}"
+            )
 
         if chart_data["MA75"].isna().all():
             st.info("過去データが75営業日未満のため、75日移動平均線は表示されません。")
