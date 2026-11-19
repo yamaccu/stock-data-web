@@ -17,6 +17,11 @@ CHART_MONTHS = 6
 INITIAL_VIEW_MONTHS = 3
 HOURLY_PERIOD = "60d"
 HOURLY_INITIAL_DAYS = 14
+QUICK_SYMBOLS = (
+    ("日経平均", "^N225"),
+    ("ゴールド先物", "GC=F"),
+    ("ビットコイン", "BTC-USD"),
+)
 RSI_PERIOD = 14
 ADX_PERIOD = 14
 UP_COLOR = "#d9534f"
@@ -318,9 +323,18 @@ def build_chart(
 
 
 st.title("📈 株価チャート")
+st.caption("よく見る銘柄")
+quick_selected = False
+for column, (label, ticker_symbol) in zip(st.columns(3), QUICK_SYMBOLS):
+    with column:
+        if st.button(label, key=f"quick_{ticker_symbol}", use_container_width=True):
+            # フォームの入力欄も更新し、次の手動検索へそのまま利用できるようにする。
+            st.session_state["ticker_code"] = ticker_symbol
+            quick_selected = True
+
 with st.form("stock_form"):
     code = st.text_input(
-        "銘柄コード", placeholder="例: 7186",
+        "銘柄コード", placeholder="例: 7186", key="ticker_code",
         help="日本株の4文字コードには自動で .T を付けます。^N225 / GC=F / BTC-USD なども指定できます。",
     )
     trade_upload = st.file_uploader(
@@ -332,7 +346,7 @@ with st.form("stock_form"):
         "チャートを表示", use_container_width=True, type="primary",
     )
 
-if submitted:
+if submitted or quick_selected:
     try:
         symbol = normalize_ticker(code)
         with st.spinner("株価データを取得しています..."):
